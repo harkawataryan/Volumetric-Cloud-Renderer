@@ -1,0 +1,13 @@
+build/
+*.user
+*.VC.db
+*.opendb
+*.pdb
+*.log
+*.cache
+*.ilk
+*.suo
+.vs/
+Release/
+Debug/
+x64/
