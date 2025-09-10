@@ -3,7 +3,6 @@ C++17 + Direct3D 11 sample that ray-marches procedural clouds using Perlin + Wor
 single-scattering with Henyey–Greenstein phase (anisotropic), temporal reprojection/accumulation,
 and a basic distance-based LOD for step size. Weather parameters drive coverage, density, wind and height.
 
-> Intentionally a touch janky (but solid). No external assets required.
 
 ## Requirements
 - Windows 10/11
