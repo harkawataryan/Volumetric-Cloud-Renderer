@@ -1,0 +1,32 @@
+name: build and render
+
+on: [push, pull_request]
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Mesa and GLFW
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libglfw3-dev libegl1-mesa-dev libgl1-mesa-dev libgl1-mesa-dri python3-pil
+      - name: Build
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
+      - name: Render a frame headless (llvmpipe)
+        run: ./build/clouds --headless --frames 8 --size 640x360 --out out.png
+      - name: Check the frame is not blank
+        run: |
+          python3 - <<'PY'
+          from PIL import Image, ImageStat
+          im = Image.open('out.png').convert('L')
+          mean = ImageStat.Stat(im).mean[0]
+          print('mean luminance', mean)
+          assert 40 < mean < 240, 'frame looks blank'
+          PY
+      - name: Benchmark (CPU rasterizer, relative numbers only)
+        run: ./build/clouds --bench --frames 4 --size 320x180
+      - uses: actions/upload-artifact@v4
+        with:
+          name: render
+          path: out.png
