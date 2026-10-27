@@ -1,0 +1,18 @@
+// Weather map, 512^2 RGBA8, tileable over the weather extent.
+//   R: coverage   G: cloud type (0 stratus .. 1 cumulonimbus)   B: unused
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(rgba8, binding = 0) uniform writeonly image2D outTex;
+uniform float uSeed;
+
+void main() {
+    ivec2 id = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(outTex);
+    if (any(greaterThanEqual(id, size))) return;
+    vec2 p = (vec2(id) + 0.5) / vec2(size);
+
+    float cov = perlinFbm3(vec3(p * 6.0, uSeed), 6, 5);
+    cov = remap(cov, 0.28, 0.72, 0.0, 1.0);
+    float type = perlinFbm3(vec3(p * 3.0 + 7.3, uSeed + 2.0), 3, 3);
+    type = remap(type, 0.35, 0.7, 0.0, 1.0);
+    imageStore(outTex, id, vec4(cov, type, 0.0, 1.0));
+}

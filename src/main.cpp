@@ -1,268 +1,246 @@
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#include <d3d11.h>
-#include <d3dcompiler.h>
-#include <DirectXMath.h>
+// Volumetric cloud renderer. Interactive by default; --headless renders to a
+// PNG without a display, --bench prints per-pass GPU timings for a few
+// configurations.
+#include "context.h"
+#include "gl.h"
+#include "renderer.h"
+
+#include <GLFW/glfw3.h>
+#include <algorithm>
 #include <cstdio>
-#include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <string>
-#include <vector>
-#include <chrono>
-#include "Halton.h"
 
-#pragma comment(lib, "d3d11.lib")
-#pragma comment(lib, "d3dcompiler.lib")
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "../third_party/stb_image_write.h"
 
-using namespace DirectX;
+namespace {
 
-static const wchar_t* kShaderPath = L"shaders/Clouds.hlsl";
+struct Options {
+    bool headless = false;
+    bool bench = false;
+    int width = 1280, height = 720;
+    int frames = 48;
+    std::string out = "clouds.png";
+    Vec3 move;   // camera translation per frame in headless mode
+    std::string shaderDir = "shaders";
+    RenderSettings settings;
+    Weather weather;
+    Camera camera;
+};
 
-LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    if (msg == WM_DESTROY) { PostQuitMessage(0); return 0; }
-    return DefWindowProc(hWnd, msg, wParam, lParam);
+void usage() {
+    printf(
+        "usage: clouds [options]\n"
+        "  --headless            render offscreen (Linux, Mesa EGL) and write --out\n"
+        "  --out FILE            PNG path for headless mode (default clouds.png)\n"
+        "  --frames N            frames to accumulate before writing (default 48)\n"
+        "  --size WxH            output resolution (default 1280x720)\n"
+        "  --scale F             cloud pass resolution scale (default 0.5)\n"
+        "  --steps N             max march steps (default 128)\n"
+        "  --no-temporal         disable reprojection/accumulation\n"
+        "  --coverage F --density F --type F --sun-el F --sun-az F\n"
+        "  --sun-intensity F --extinction F --ambient F --erosion F   look tuning\n"
+        "  --cam X,Y,Z --yaw F --pitch F\n"
+        "  --move X,Y,Z          headless: move the camera this much every frame\n"
+        "  --bench               time each pass for several configurations and exit\n"
+        "  --shaders DIR         shader directory (default ./shaders)\n");
 }
 
-struct CameraCB {
-    XMMATRIX view;
-    XMMATRIX proj;
-    XMMATRIX prevViewProj;
-    XMFLOAT3 camPos;
-    float    time;
-    XMFLOAT2 jitter;
-    float    taaEnabled;
-    float    pad0;
-};
-
-struct WeatherCB {
-    XMFLOAT3 sunDir; float g;
-    float coverage; float density; float baseHeight; float thickness;
-    XMFLOAT2 wind; float stepMul; float jitterEnabled;
-};
-
-struct FrameContext {
-    HWND hwnd{};
-    UINT width{1280}, height{720};
-    bool running{true};
-    float moveSpeed = 8.f;
-    float yaw = 0.0f, pitch = 0.0f;
-    XMFLOAT3 camPos{0, 1000, -1500};
-    float sunAz = 45.f * XM_PI/180.f;
-    float sunEl = 20.f * XM_PI/180.f;
-    float g = 0.65f;
-    float coverage = 0.45f;
-    float density = 0.8f;
-    float baseH = 1500.f;
-    float thick = 2000.f;
-    XMFLOAT2 wind{15.f, 5.f};
-    float stepMul = 1.0f;
-    bool taa = true;
-    bool jitter = true;
-};
-
-bool KeyDown(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
-
-HRESULT CompileShader(const wchar_t* path, const char* entry, const char* target, ID3DBlob** blob) {
-    DWORD flags = D3DCOMPILE_ENABLE_STRICTNESS;
-#ifdef _DEBUG
-    flags |= D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
-#else
-    flags |= D3DCOMPILE_OPTIMIZATION_LEVEL3;
+bool parse(int argc, char** argv, Options& o) {
+    auto next = [&](int& i) -> const char* {
+        if (i + 1 >= argc) { usage(); exit(1); }
+        return argv[++i];
+    };
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--headless") o.headless = true;
+        else if (a == "--bench") {
+            o.bench = true;
+#if defined(__linux__)
+            o.headless = true;   // no display needed
 #endif
-    ID3DBlob* errorBlob = nullptr;
-    HRESULT hr = D3DCompileFromFile(path, nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE,
-        entry, target, flags, 0, blob, &errorBlob);
-    if (FAILED(hr)) {
-        if (errorBlob) { OutputDebugStringA((char*)errorBlob->GetBufferPointer()); errorBlob->Release(); }
+        }
+        else if (a == "--out") o.out = next(i);
+        else if (a == "--frames") o.frames = atoi(next(i));
+        else if (a == "--size") sscanf(next(i), "%dx%d", &o.width, &o.height);
+        else if (a == "--scale") o.settings.scale = (float)atof(next(i));
+        else if (a == "--steps") o.settings.maxSteps = atoi(next(i));
+        else if (a == "--no-temporal") o.settings.temporal = false;
+        else if (a == "--coverage") o.weather.coverage = (float)atof(next(i));
+        else if (a == "--density") o.weather.density = (float)atof(next(i));
+        else if (a == "--type") o.weather.cloudType = (float)atof(next(i));
+        else if (a == "--sun-el") o.weather.sunElevation = (float)atof(next(i));
+        else if (a == "--sun-az") o.weather.sunAzimuth = (float)atof(next(i));
+        else if (a == "--sun-intensity") o.weather.sunIntensity = (float)atof(next(i));
+        else if (a == "--extinction") o.weather.extinction = (float)atof(next(i));
+        else if (a == "--ambient") o.weather.ambient = (float)atof(next(i));
+        else if (a == "--move") sscanf(next(i), "%f,%f,%f", &o.move.x, &o.move.y, &o.move.z);
+        else if (a == "--erosion") o.weather.erosion = (float)atof(next(i));
+        else if (a == "--cam") sscanf(next(i), "%f,%f,%f", &o.camera.pos.x, &o.camera.pos.y, &o.camera.pos.z);
+        else if (a == "--yaw") o.camera.yaw = (float)atof(next(i));
+        else if (a == "--pitch") o.camera.pitch = (float)atof(next(i));
+        else if (a == "--shaders") o.shaderDir = next(i);
+        else if (a == "--help" || a == "-h") { usage(); exit(0); }
+        else { fprintf(stderr, "unknown option %s\n", argv[i]); usage(); return false; }
     }
-    return hr;
+    return true;
 }
 
-int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
-    FrameContext fc;
-
-    WNDCLASSEX wc{ sizeof(WNDCLASSEX) };
-    wc.style = CS_OWNDC;
-    wc.lpfnWndProc = WndProc;
-    wc.hInstance = hInst;
-    wc.lpszClassName = L"CloudWnd";
-    RegisterClassEx(&wc);
-
-    RECT r{0,0,(LONG)fc.width,(LONG)fc.height};
-    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-    HWND hwnd = CreateWindowEx(0, wc.lpszClassName, L"Volumetric Clouds (D3D11)",
-        WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT,
-        r.right - r.left, r.bottom - r.top, 0, 0, hInst, 0);
-    fc.hwnd = hwnd;
-
-    DXGI_SWAP_CHAIN_DESC sd{};
-    sd.BufferCount = 2;
-    sd.BufferDesc.Width = fc.width;
-    sd.BufferDesc.Height = fc.height;
-    sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT | DXGI_USAGE_SHADER_INPUT;
-    sd.OutputWindow = hwnd;
-    sd.SampleDesc.Count = 1;
-    sd.Windowed = TRUE;
-    sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
-
-    ID3D11Device* device{}; ID3D11DeviceContext* ctx{}; IDXGISwapChain* swap{};
-    D3D_FEATURE_LEVEL fl;
-    D3D_FEATURE_LEVEL req[] = { D3D_FEATURE_LEVEL_11_0 };
-    HRESULT hr = D3D11CreateDeviceAndSwapChain(
-        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, req, 1,
-        D3D11_SDK_VERSION, &sd, &swap, &device, &fl, &ctx);
-    if (FAILED(hr)) return 0;
-
-    auto CreateRT = [&](UINT w, UINT h, ID3D11Texture2D** tex, ID3D11RenderTargetView** rtv, ID3D11ShaderResourceView** srv) {
-        D3D11_TEXTURE2D_DESC td{};
-        td.Width=w; td.Height=h; td.MipLevels=1; td.ArraySize=1;
-        td.Format=DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count=1;
-        td.Usage=D3D11_USAGE_DEFAULT; td.BindFlags=D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE;
-        device->CreateTexture2D(&td, nullptr, tex);
-        device->CreateRenderTargetView(*tex, nullptr, rtv);
-        device->CreateShaderResourceView(*tex, nullptr, srv);
-    };
-
-    ID3D11Texture2D* bbTex{}; ID3D11RenderTargetView* bbRTV{}; ID3D11ShaderResourceView* bbSRV{};
-    CreateRT(fc.width, fc.height, &bbTex, &bbRTV, &bbSRV);
-
-    ID3D11Texture2D* histTex{}; ID3D11RenderTargetView* histRTV{}; ID3D11ShaderResourceView* histSRV{};
-    CreateRT(fc.width, fc.height, &histTex, &histRTV, &histSRV);
-
-    ID3D11Texture2D* scBB{}; swap->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&scBB);
-    ID3D11RenderTargetView* scRTV{}; device->CreateRenderTargetView(scBB, nullptr, &scRTV);
-    scBB->Release();
-
-    ID3DBlob* vsBlob{}; ID3DBlob* psBlob{}; ID3DBlob* blitBlob{};
-    CompileShader(L"shaders/Clouds.hlsl", "VSFull", "vs_5_0", &vsBlob);
-    CompileShader(L"shaders/Clouds.hlsl", "PSClouds", "ps_5_0", &psBlob);
-    CompileShader(L"shaders/Clouds.hlsl", "PSBlit", "ps_5_0", &blitBlob);
-
-    ID3D11VertexShader* vs{}; device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &vs);
-    ID3D11PixelShader* ps{}; device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &ps);
-    ID3D11PixelShader* psBlit{}; device->CreatePixelShader(blitBlob->GetBufferPointer(), blitBlob->GetBufferSize(), nullptr, &psBlit);
-    ID3D11InputLayout* il{};
-
-    ID3D11SamplerState* samp{};
-    D3D11_SAMPLER_DESC sdsc{}; sdsc.Filter=D3D11_FILTER_MIN_MAG_MIP_LINEAR; sdsc.AddressU=sdsc.AddressV=sdsc.AddressW=D3D11_TEXTURE_ADDRESS_CLAMP;
-    device->CreateSamplerState(&sdsc, &samp);
-
-    ID3D11Buffer* cbCamera{}; ID3D11Buffer* cbWeather{};
-    auto MakeCB=[&](UINT size, ID3D11Buffer** out){
-        D3D11_BUFFER_DESC bd{}; bd.BindFlags=D3D11_BIND_CONSTANT_BUFFER; bd.ByteWidth=((size+15)/16)*16; bd.Usage=D3D11_USAGE_DYNAMIC; bd.CPUAccessFlags=D3D11_CPU_ACCESS_WRITE;
-        device->CreateBuffer(&bd,nullptr,out);
-    };
-    MakeCB(sizeof(CameraCB), &cbCamera);
-    MakeCB(sizeof(WeatherCB), &cbWeather);
-
-    XMMATRIX prevVP = XMMatrixIdentity();
-    uint32_t frameIndex = 1;
-    auto t0 = std::chrono::high_resolution_clock::now();
-
-    while (fc.running) {
-        MSG msg; while (PeekMessage(&msg, 0, 0, 0, PM_REMOVE)) {
-            if (msg.message==WM_QUIT) fc.running=false;
-            TranslateMessage(&msg); DispatchMessage(&msg);
-        }
-        if (!fc.running) break;
-
-        float dt = 1.0f/60.0f;
-        XMVECTOR forward = XMVector3Normalize(XMVectorSet(sinf(fc.yaw), 0, cosf(fc.yaw), 0));
-        XMVECTOR right = XMVector3Cross(forward, XMVectorSet(0,1,0,0));
-        XMVECTOR pos = XMLoadFloat3(&fc.camPos);
-        if (KeyDown('W')) pos = XMVectorAdd(pos, XMVectorScale(forward, fc.moveSpeed));
-        if (KeyDown('S')) pos = XMVectorAdd(pos, XMVectorScale(forward, -fc.moveSpeed));
-        if (KeyDown('A')) pos = XMVectorAdd(pos, XMVectorScale(right, -fc.moveSpeed));
-        if (KeyDown('D')) pos = XMVectorAdd(pos, XMVectorScale(right, fc.moveSpeed));
-        if (KeyDown('Q')) pos = XMVectorAdd(pos, XMVectorSet(0,-fc.moveSpeed,0,0));
-        if (KeyDown('E')) pos = XMVectorAdd(pos, XMVectorSet(0,fc.moveSpeed,0,0));
-        XMStoreFloat3(&fc.camPos, pos);
-
-        if (KeyDown(VK_LEFT))  fc.wind.x -= 0.1f;
-        if (KeyDown(VK_RIGHT)) fc.wind.x += 0.1f;
-        if (KeyDown(VK_UP))    fc.wind.y += 0.1f;
-        if (KeyDown(VK_DOWN))  fc.wind.y -= 0.1f;
-        if (KeyDown('Z')) fc.coverage = max(0.f, fc.coverage - 0.002f);
-        if (KeyDown('X')) fc.coverage = min(1.f, fc.coverage + 0.002f);
-        if (KeyDown('C')) fc.density = max(0.f, fc.density - 0.002f);
-        if (KeyDown('V')) fc.density = min(2.f, fc.density + 0.002f);
-        if (KeyDown('O')) fc.sunAz -= 0.002f;
-        if (KeyDown('P')) fc.sunAz += 0.002f;
-        if (KeyDown('K')) fc.sunEl = max(-XM_PIDIV2*0.9f, fc.sunEl - 0.002f);
-        if (KeyDown('L')) fc.sunEl = min(XM_PIDIV2*0.9f,  fc.sunEl + 0.002f);
-        if (GetAsyncKeyState('T') & 1) fc.taa = !fc.taa;
-        if (GetAsyncKeyState('F') & 1) fc.jitter = !fc.jitter;
-        if (GetAsyncKeyState('R') & 1) { fc.coverage=0.45f; fc.density=0.8f; fc.wind={15,5}; }
-
-        float aspect = (float)fc.width / (float)fc.height;
-        XMMATRIX proj = XMMatrixPerspectiveFovLH(XMConvertToRadians(60.f), aspect, 0.1f, 50000.f);
-        XMVECTOR p = XMLoadFloat3(&fc.camPos);
-        XMVECTOR f = XMVectorSet(cosf(fc.pitch)*sinf(fc.yaw), sinf(fc.pitch), cosf(fc.pitch)*cosf(fc.yaw), 0);
-        XMVECTOR up = XMVectorSet(0,1,0,0);
-        XMMATRIX view = XMMatrixLookToLH(p, f, up);
-        XMMATRIX vp = XMMatrixMultiply(view, proj);
-
-        float jx = 0.f, jy = 0.f;
-        if (fc.jitter) { jx = (Halton(frameIndex,2) - 0.5f) / fc.width; jy = (Halton(frameIndex,3) - 0.5f) / fc.height; }
-
-        D3D11_MAPPED_SUBRESOURCE map{};
-        if (SUCCEEDED(ctx->Map(cbCamera, 0, D3D11_MAP_WRITE_DISCARD, 0, &map))) {
-            auto* c = (CameraCB*)map.pData;
-            c->view = XMMatrixTranspose(view);
-            c->proj = XMMatrixTranspose(proj);
-            c->prevViewProj = XMMatrixTranspose(prevVP);
-            c->camPos = fc.camPos;
-            auto now = std::chrono::high_resolution_clock::now();
-            c->time = std::chrono::duration<float>(now.time_since_epoch()).count()*0.001f;
-            c->jitter = XMFLOAT2(jx, jy);
-            c->taaEnabled = fc.taa ? 1.f : 0.f;
-            ctx->Unmap(cbCamera, 0);
-        }
-        if (SUCCEEDED(ctx->Map(cbWeather, 0, D3D11_MAP_WRITE_DISCARD, 0, &map))) {
-            auto* w = (WeatherCB*)map.pData;
-            XMFLOAT3 s{ cosf(fc.sunEl)*cosf(fc.sunAz), sinf(fc.sunEl), cosf(fc.sunEl)*sinf(fc.sunAz) };
-            w->sunDir = s; w->g = fc.g;
-            w->coverage = fc.coverage; w->density = fc.density; w->baseHeight = fc.baseH; w->thickness = fc.thick;
-            w->wind = fc.wind; w->stepMul = fc.stepMul; w->jitterEnabled = fc.jitter ? 1.f : 0.f;
-            ctx->Unmap(cbWeather, 0);
-        }
-
-        // Render clouds into bbRTV
-        ID3D11RenderTargetView* rt[] = { bbRTV };
-        ctx->OMSetRenderTargets(1, rt, nullptr);
-        float clearC[4]{0.6f,0.75f,0.95f,1};
-        ctx->ClearRenderTargetView(bbRTV, clearC);
-        D3D11_VIEWPORT vpD{}; vpD.Width=(float)fc.width; vpD.Height=(float)fc.height; vpD.MinDepth=0; vpD.MaxDepth=1;
-        ctx->RSSetViewports(1, &vpD);
-        ctx->VSSetShader(vs, nullptr, 0);
-        ctx->PSSetSamplers(0, 1, &samp);
-        ctx->PSSetConstantBuffers(0, 1, &cbCamera);
-        ctx->PSSetConstantBuffers(1, 1, &cbWeather);
-        ctx->PSSetShaderResources(0, 1, &histSRV);
-        ctx->PSSetShader(ps, nullptr, 0);
-        ctx->IASetInputLayout(il);
-        ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        ctx->Draw(3,0);
-
-        // accumulate into history
-        ctx->CopyResource(histTex, bbTex);
-
-        // blit to swapchain
-        ID3D11Texture2D* scBB{}; swap->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&scBB);
-        ID3D11RenderTargetView* scRTV{}; device->CreateRenderTargetView(scBB, nullptr, &scRTV);
-        ctx->OMSetRenderTargets(1, &scRTV, nullptr);
-        ID3D11ShaderResourceView* src = histSRV;
-        ctx->PSSetShaderResources(0, 1, &src);
-        ctx->PSSetShader(psBlit, nullptr, 0);
-        ctx->Draw(3,0);
-        scRTV->Release(); scBB->Release();
-
-        swap->Present(1,0);
-        prevVP = vp;
-        frameIndex++;
-        ID3D11ShaderResourceView* nullSRV{}; ctx->PSSetShaderResources(0,1,&nullSRV);
-        if (GetAsyncKeyState(VK_ESCAPE)&1) fc.running=false;
+bool writePng(const std::string& path, Renderer& r) {
+    int w, h;
+    auto px = r.readback(w, h);
+    if (!stbi_write_png(path.c_str(), w, h, 3, px.data(), w * 3)) {
+        fprintf(stderr, "failed to write %s\n", path.c_str());
+        return false;
     }
+    printf("wrote %s (%dx%d)\n", path.c_str(), w, h);
+    return true;
+}
 
+int runHeadless(Options& o, Context& ctx, Renderer& r) {
+    for (int i = 0; i < o.frames; ++i) {
+        r.render(o.camera, o.weather, o.settings, i / 60.0f);
+        ctx.swap();
+        o.camera.pos += o.move;
+    }
+    auto t = r.timings();
+    printf("last frame: clouds %.2f ms, resolve %.2f ms, composite %.2f ms, total %.2f ms\n",
+           t.cloudMs, t.resolveMs, t.compositeMs, t.totalMs);
+    return writePng(o.out, r) ? 0 : 1;
+}
+
+// Average GPU time per pass over a window of frames for one configuration.
+FrameTimings timeConfig(Renderer& r, Context& ctx, const Options& o, const RenderSettings& s, int frames) {
+    r.resetHistory();
+    FrameTimings acc;
+    for (int i = 0; i < frames + 8; ++i) {
+        r.render(o.camera, o.weather, s, 0.0f);
+        ctx.swap();
+        if (i >= 8) {
+            auto t = r.timings();
+            acc.cloudMs += t.cloudMs; acc.resolveMs += t.resolveMs;
+            acc.compositeMs += t.compositeMs; acc.totalMs += t.totalMs;
+        }
+    }
+    acc.cloudMs /= frames; acc.resolveMs /= frames; acc.compositeMs /= frames; acc.totalMs /= frames;
+    return acc;
+}
+
+int runBench(Options& o, Context& ctx, Renderer& r) {
+    struct Cfg { const char* name; float scale; bool temporal; int steps; };
+    const Cfg cfgs[] = {
+        {"full-res, 128 steps, no temporal", 1.0f, false, 128},
+        {"full-res, 64 steps, no temporal", 1.0f, false, 64},
+        {"half-res, 128 steps, temporal", 0.5f, true, 128},
+        {"quarter-res, 128 steps, temporal", 0.25f, true, 128},
+    };
+    printf("%dx%d, %s\n", o.width, o.height, (const char*)glGetString(GL_RENDERER));
+    printf("%-38s %10s %10s %10s %10s\n", "configuration", "clouds ms", "resolve", "composite", "total");
+    for (const Cfg& c : cfgs) {
+        RenderSettings s = o.settings;
+        s.scale = c.scale; s.temporal = c.temporal; s.maxSteps = c.steps;
+        FrameTimings t = timeConfig(r, ctx, o, s, o.frames);
+        printf("%-38s %10.2f %10.2f %10.2f %10.2f\n", c.name, t.cloudMs, t.resolveMs, t.compositeMs, t.totalMs);
+    }
     return 0;
+}
+
+int runInteractive(Options& o, Context& ctx, Renderer& r) {
+    double last = ctx.time();
+    double fpsAccum = 0;
+    int fpsFrames = 0;
+    bool paused = false;
+    float simTime = 0.f;
+    while (!ctx.shouldClose()) {
+        ctx.pollEvents();
+        double now = ctx.time();
+        float dt = (float)(now - last);
+        last = now;
+        if (!paused) simTime += dt;
+
+        int w, h;
+        ctx.framebufferSize(w, h);
+        if (w != o.width || h != o.height) { o.width = w; o.height = h; r.resize(w, h); }
+
+        float dx, dy;
+        ctx.mouseDelta(dx, dy);
+        o.camera.yaw += dx * 0.0025f;
+        o.camera.pitch = std::max(-1.5f, std::min(1.5f, o.camera.pitch - dy * 0.0025f));
+
+        float speed = (ctx.keyDown(GLFW_KEY_LEFT_SHIFT) ? 2000.f : 400.f) * dt;
+        Vec3 fwd = o.camera.forward();
+        Vec3 right = normalize(cross(fwd, Vec3(0, 1, 0)));
+        if (ctx.keyDown(GLFW_KEY_W)) o.camera.pos += fwd * speed;
+        if (ctx.keyDown(GLFW_KEY_S)) o.camera.pos += fwd * -speed;
+        if (ctx.keyDown(GLFW_KEY_A)) o.camera.pos += right * -speed;
+        if (ctx.keyDown(GLFW_KEY_D)) o.camera.pos += right * speed;
+        if (ctx.keyDown(GLFW_KEY_Q)) o.camera.pos.y -= speed;
+        if (ctx.keyDown(GLFW_KEY_E)) o.camera.pos.y += speed;
+
+        float k = dt * 0.4f;
+        if (ctx.keyDown(GLFW_KEY_Z)) o.weather.coverage = std::max(0.f, o.weather.coverage - k);
+        if (ctx.keyDown(GLFW_KEY_X)) o.weather.coverage = std::min(1.f, o.weather.coverage + k);
+        if (ctx.keyDown(GLFW_KEY_C)) o.weather.density = std::max(0.1f, o.weather.density - k);
+        if (ctx.keyDown(GLFW_KEY_V)) o.weather.density = std::min(3.f, o.weather.density + k);
+        if (ctx.keyDown(GLFW_KEY_B)) o.weather.cloudType = std::max(0.f, o.weather.cloudType - k);
+        if (ctx.keyDown(GLFW_KEY_N)) o.weather.cloudType = std::min(1.f, o.weather.cloudType + k);
+        if (ctx.keyDown(GLFW_KEY_O)) o.weather.sunAzimuth -= k;
+        if (ctx.keyDown(GLFW_KEY_P)) o.weather.sunAzimuth += k;
+        if (ctx.keyDown(GLFW_KEY_K)) o.weather.sunElevation = std::max(-0.1f, o.weather.sunElevation - k * 0.5f);
+        if (ctx.keyDown(GLFW_KEY_L)) o.weather.sunElevation = std::min(1.5f, o.weather.sunElevation + k * 0.5f);
+        if (ctx.keyPressed(GLFW_KEY_T)) { o.settings.temporal = !o.settings.temporal; r.resetHistory(); }
+        if (ctx.keyPressed(GLFW_KEY_1)) o.settings.scale = 1.0f;
+        if (ctx.keyPressed(GLFW_KEY_2)) o.settings.scale = 0.5f;
+        if (ctx.keyPressed(GLFW_KEY_3)) o.settings.scale = 0.25f;
+        if (ctx.keyPressed(GLFW_KEY_SPACE)) paused = !paused;
+        if (ctx.keyPressed(GLFW_KEY_H)) o.settings.showNoise = !o.settings.showNoise;
+        if (ctx.keyPressed(GLFW_KEY_R)) o.weather = Weather();
+        if (ctx.keyPressed(GLFW_KEY_F5)) { if (r.reloadShaders()) printf("shaders reloaded\n"); }
+        if (ctx.keyPressed(GLFW_KEY_F12)) writePng("screenshot.png", r);
+        if (ctx.keyDown(GLFW_KEY_ESCAPE)) break;
+
+        r.render(o.camera, o.weather, o.settings, simTime);
+        ctx.swap();
+
+        fpsAccum += dt;
+        if (++fpsFrames >= 30) {
+            auto t = r.timings();
+            char title[256];
+            snprintf(title, sizeof title,
+                     "Volumetric Clouds  %.1f fps | clouds %.2f ms resolve %.2f ms | scale %.2f %s | cov %.2f dens %.2f type %.2f",
+                     fpsFrames / fpsAccum, t.cloudMs, t.resolveMs, o.settings.scale,
+                     o.settings.temporal ? "temporal" : "no-temporal",
+                     o.weather.coverage, o.weather.density, o.weather.cloudType);
+            ctx.setTitle(title);
+            fpsAccum = 0;
+            fpsFrames = 0;
+        }
+    }
+    return 0;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    Options o;
+    if (!parse(argc, argv, o)) return 1;
+
+    ContextDesc d;
+    d.width = o.width;
+    d.height = o.height;
+    d.headless = o.headless;
+    Context* ctx = createContext(d);
+    if (!ctx) return 1;
+
+    Renderer r;
+    if (!r.init(o.shaderDir, o.width, o.height, o.headless)) return 1;
+
+    int rc;
+    if (o.bench) rc = runBench(o, *ctx, r);
+    else if (o.headless) rc = runHeadless(o, *ctx, r);
+    else rc = runInteractive(o, *ctx, r);
+    delete ctx;
+    return rc;
 }

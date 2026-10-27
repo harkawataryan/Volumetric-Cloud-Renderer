@@ -1,0 +1,15 @@
+// High-frequency detail, 32^3 RGBA8, tileable: Worley fbm at three scales
+// used to erode the edges of the base shape.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+layout(rgba8, binding = 0) uniform writeonly image3D outTex;
+
+void main() {
+    ivec3 id = ivec3(gl_GlobalInvocationID);
+    ivec3 size = imageSize(outTex);
+    if (any(greaterThanEqual(id, size))) return;
+    vec3 p = (vec3(id) + 0.5) / vec3(size);
+    float a = worleyFbm3(p * 2.0, 2);
+    float b = worleyFbm3(p * 4.0, 4);
+    float c = worleyFbm3(p * 8.0, 8);
+    imageStore(outTex, id, vec4(a, b, c, 1.0));
+}

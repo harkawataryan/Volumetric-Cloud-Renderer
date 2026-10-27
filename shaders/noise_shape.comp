@@ -1,0 +1,20 @@
+// Base cloud shape, 128^3 RGBA8, tileable.
+//   R: Perlin-Worley (Perlin fbm eroded by Worley) - the overall billow shape
+//   G,B,A: Worley fbm at increasing frequency, used to erode R
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+layout(rgba8, binding = 0) uniform writeonly image3D outTex;
+
+void main() {
+    ivec3 id = ivec3(gl_GlobalInvocationID);
+    ivec3 size = imageSize(outTex);
+    if (any(greaterThanEqual(id, size))) return;
+    vec3 p = (vec3(id) + 0.5) / vec3(size);
+
+    float perlin = perlinFbm3(p * 4.0, 4, 6);
+    float w0 = worleyFbm3(p * 4.0, 4);
+    float w1 = worleyFbm3(p * 8.0, 8);
+    float w2 = worleyFbm3(p * 16.0, 16);
+    // Dilate Perlin with Worley so billows get sharp edges (Schneider 2015).
+    float perlinWorley = remap(perlin, 0.0, 1.0, w0, 1.0);
+    imageStore(outTex, id, vec4(perlinWorley, w0, w1, w2));
+}
