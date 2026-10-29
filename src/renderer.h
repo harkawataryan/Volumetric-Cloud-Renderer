@@ -5,8 +5,8 @@
 
 struct Weather {
     float coverage = 0.5f;    // 0..1, shifts the weather map's coverage
-    float density = 1.0f;     // extinction multiplier
-    float cloudType = 0.55f;  // 0 stratus .. 1 cumulonimbus
+    float density = 3.0f;     // extinction multiplier
+    float cloudType = 0.75f;  // 0 stratus .. 1 cumulonimbus
     float baseHeight = 1500.f;
     float thickness = 2500.f;
     float windX = 12.f, windZ = 4.f;
@@ -16,7 +16,7 @@ struct Weather {
     float sunIntensity = 10.f;
     float extinction = 0.012f; // per metre at density 1
     float ambient = 1.0f;
-    float erosion = 0.45f;     // how much the detail noise eats into cloud edges
+    float erosion = 0.75f;     // how much the detail noise eats into cloud edges
 };
 
 struct RenderSettings {

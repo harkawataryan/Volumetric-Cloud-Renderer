@@ -29,11 +29,12 @@ uniform float uAmbient;
 uniform float uErosion;
 
 const float EARTH_RADIUS = 6371000.0;
-const float SHAPE_SCALE = 1.0 / 9000.0;     // metres per noise tile
-const float DETAIL_SCALE = 1.0 / 900.0;
+const float SHAPE_SCALE = 1.0 / 6000.0;     // metres per noise tile
+const float DETAIL_SCALE = 1.0 / 700.0;
 const float WEATHER_SCALE = 1.0 / 48000.0;
-const vec3 AMBIENT_TOP = vec3(0.62, 0.74, 0.95);
-const vec3 AMBIENT_BOTTOM = vec3(0.36, 0.42, 0.52);
+const vec3 AMBIENT_TOP = vec3(0.70, 0.82, 1.00);
+const vec3 AMBIENT_BOTTOM = vec3(0.44, 0.50, 0.60);
+const vec3 GROUND_BOUNCE = vec3(0.30, 0.32, 0.26);
 
 // Entry/exit distances of a ray through the spherical shell [rInner, rOuter],
 // for a camera below, inside or above the layer.
@@ -72,7 +73,7 @@ float heightFraction(vec3 p) {
 // cumulus are taller with a rounded top, cumulonimbus fill the layer.
 float heightGradient(float h, float type) {
     float stratus = remap(h, 0.0, 0.08, 0.0, 1.0) * remap(h, 0.15, 0.3, 1.0, 0.0);
-    float cumulus = remap(h, 0.0, 0.15, 0.0, 1.0) * remap(h, 0.45, 0.8, 1.0, 0.0);
+    float cumulus = remap(h, 0.0, 0.06, 0.0, 1.0) * remap(h, 0.35, 0.85, 1.0, 0.0);
     float cumulonimbus = remap(h, 0.0, 0.1, 0.0, 1.0) * remap(h, 0.75, 1.0, 1.0, 0.0);
     float a = clamp(type * 2.0, 0.0, 1.0);
     float b = clamp(type * 2.0 - 1.0, 0.0, 1.0);
@@ -130,17 +131,23 @@ vec3 scatteredLight(float opticalDepth, float cosTheta, float h) {
     for (int k = 0; k < 4; ++k) {
         float phase = 0.65 * phaseHG(cosTheta, uAnisotropy * c) + 0.35 * phaseHG(cosTheta, -0.3 * c);
         sun += a * exp(-opticalDepth * sigma * b) * phase;
-        a *= 0.55; b *= 0.45; c *= 0.6;
+        a *= 0.6; b *= 0.4; c *= 0.6;
     }
-    // Powder: darken thin, back-lit regions where little in-scattering happens.
+    // Powder: thin regions facing away from the sun get little in-scattering
+    // and look darker. Applied when the sun is behind the viewer, so edges
+    // seen against the sun keep their bright silver lining.
     float powder = 1.0 - exp(-opticalDepth * sigma * 2.0);
-    sun *= mix(1.0, powder, clamp(cosTheta * 0.5 + 0.5, 0.0, 1.0) * 0.5);
-    vec3 ambient = mix(AMBIENT_BOTTOM, AMBIENT_TOP, h) * uAmbient;
-    float ambientTerm = exp(-opticalDepth * sigma * 0.2) * 0.7 + 0.1;
+    sun *= mix(1.0, powder, clamp(0.5 - cosTheta * 0.5, 0.0, 1.0) * 0.6);
+    // Sky light from above, a little bounce light from the ground below.
+    vec3 ambient = (mix(AMBIENT_BOTTOM, AMBIENT_TOP, h) + GROUND_BOUNCE * (1.0 - h)) * uAmbient;
+    float ambientTerm = exp(-opticalDepth * sigma * 0.15) * 0.6 + 0.3;
     // Warm the sun and dim the ambient as it approaches the horizon.
     float sunset = 1.0 - smoothstep(0.0, 0.35, uSunDir.y);
-    vec3 sunColor = mix(vec3(1.0, 0.96, 0.9), vec3(1.0, 0.62, 0.38), sunset);
-    ambient *= mix(1.0, 0.6, sunset);
+    vec3 sunColor = mix(vec3(1.0, 0.96, 0.9), vec3(1.0, 0.55, 0.28), sunset) * mix(1.0, 1.6, sunset);
+    // At sunset the shadowed sides pick up the cool blue-violet of the upper sky.
+    ambient *= mix(vec3(1.0), vec3(0.55, 0.52, 0.72), sunset);
+    // ...and the lower parts catch warm light from the glowing horizon.
+    ambient += vec3(1.0, 0.55, 0.32) * sunset * (1.0 - h) * 0.5 * uAmbient;
     return sunColor * uSunIntensity * sun + ambient * ambientTerm * (1.0 / PI);
 }
 

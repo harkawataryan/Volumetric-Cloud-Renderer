@@ -12,7 +12,7 @@ It runs interactively through GLFW, or headless through surfaceless EGL on Linux
 
 **Cloud model.** A 128³ shape texture (Perlin fbm dilated by Worley, plus three Worley octaves) and a 32³ Worley detail texture, both generated on the GPU by compute shaders at startup and tileable so the layer extends to the horizon. A 512² weather map gives coverage and cloud type per region. Cloud type picks a vertical density profile (stratus, cumulus, cumulonimbus), and the detail texture erodes the edges of the base shape, with less erosion where coverage is high so solid decks stay solid. Wind scrolls the noise over time with a little shear by height.
 
-**Lighting.** Each march step takes six samples toward the sun to get optical depth, then evaluates a four-octave multiple-scattering approximation (attenuated extinction, contribution and phase eccentricity per octave, after Wrenninge and Hillaire) with a two-lobe Henyey-Greenstein phase function. A powder term darkens back-lit edges, and an ambient term fades from blue at the top of the layer to grey at the bottom. In-scattering is integrated analytically over each step so the result does not depend on step size. The sun and sky colour shift warm as the sun nears the horizon.
+**Lighting.** Each march step takes six samples toward the sun to get optical depth, then evaluates a four-octave multiple-scattering approximation (attenuated extinction, contribution and phase eccentricity per octave, after Wrenninge and Hillaire) with a two-lobe Henyey-Greenstein phase function. A powder term darkens thin edges when the sun is behind the viewer, so edges seen against the sun keep their silver lining. Ambient light is sky light fading from blue at the top of the layer to grey at the bottom, plus a little ground bounce on the undersides; at sunset the shadowed sides turn blue-violet and the lower parts pick up warm light from the horizon. In-scattering is integrated analytically over each step so the result does not depend on step size. The sun and sky colour shift warm as the sun nears the horizon. In the composite, distant clouds fade toward the horizon haze by their marched depth.
 
 **Marching.** Rays intersect a spherical shell around the planet, so the layer curves away at the horizon and the camera can be below, inside or above it. Step size is derived from the ray's span through the layer. Steps are jittered per pixel with interleaved gradient noise that changes each frame, and the march stops once transmittance drops below 0.5%. The pass writes radiance, transmittance and a transmittance-weighted mean depth.
 
@@ -22,14 +22,14 @@ It runs interactively through GLFW, or headless through surfaceless EGL on Linux
 
 ## Performance
 
-`--bench` times each pass over a window of frames. These numbers are from Mesa llvmpipe (a CPU rasterizer) at 640×360, so the absolute values are meaningless. The ratios are the point: half-resolution with reprojection costs 29% of the full-resolution march for a result that converges to the same image.
+`--bench` times each pass over a window of frames. These numbers are from Mesa llvmpipe (a CPU rasterizer) at 640×360, so the absolute values are meaningless. The ratios are the point: half-resolution with reprojection costs about a third of the full-resolution frame (the cloud pass alone is 3.4× cheaper) for a result that converges to the same image.
 
 | configuration | cloud pass | resolve | composite | total |
 |---|---|---|---|---|
-| full-res, 128 steps, no temporal | 899 ms | 13 ms | 15 ms | 927 ms |
-| full-res, 64 steps, no temporal | 468 ms | 8 ms | 15 ms | 490 ms |
-| half-res, 128 steps, temporal | 221 ms | 27 ms | 18 ms | 266 ms |
-| quarter-res, 128 steps, temporal | 81 ms | 30 ms | 13 ms | 124 ms |
+| full-res, 128 steps, no temporal | 233 ms | 1 ms | 3 ms | 237 ms |
+| full-res, 64 steps, no temporal | 128 ms | 2 ms | 3 ms | 133 ms |
+| half-res, 128 steps, temporal | 68 ms | 6 ms | 3 ms | 77 ms |
+| quarter-res, 128 steps, temporal | 23 ms | 6 ms | 3 ms | 32 ms |
 
 Run `clouds --bench --size 1920x1080` on a GPU for real numbers.
 
@@ -72,6 +72,8 @@ Shaders are read at runtime from `./shaders`, or wherever `--shaders` points.
 | R | reset weather |
 | F5 | reload shaders |
 | F12 | save screenshot.png |
+
+The images at the top come from `docs/render.sh`, which runs these three views headless at 1280×720.
 
 Headless options: `--size WxH`, `--frames N` (frames to accumulate before saving), `--cam X,Y,Z --yaw --pitch`, `--move X,Y,Z` (per-frame camera motion, for testing reprojection), and the weather flags `--coverage --density --type --sun-el --sun-az`. `--help` lists everything.
 

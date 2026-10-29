@@ -183,7 +183,7 @@ int runInteractive(Options& o, Context& ctx, Renderer& r) {
         if (ctx.keyDown(GLFW_KEY_Z)) o.weather.coverage = std::max(0.f, o.weather.coverage - k);
         if (ctx.keyDown(GLFW_KEY_X)) o.weather.coverage = std::min(1.f, o.weather.coverage + k);
         if (ctx.keyDown(GLFW_KEY_C)) o.weather.density = std::max(0.1f, o.weather.density - k);
-        if (ctx.keyDown(GLFW_KEY_V)) o.weather.density = std::min(3.f, o.weather.density + k);
+        if (ctx.keyDown(GLFW_KEY_V)) o.weather.density = std::min(6.f, o.weather.density + k);
         if (ctx.keyDown(GLFW_KEY_B)) o.weather.cloudType = std::max(0.f, o.weather.cloudType - k);
         if (ctx.keyDown(GLFW_KEY_N)) o.weather.cloudType = std::min(1.f, o.weather.cloudType + k);
         if (ctx.keyDown(GLFW_KEY_O)) o.weather.sunAzimuth -= k;
